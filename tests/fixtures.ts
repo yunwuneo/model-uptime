@@ -1,0 +1,30 @@
+import type { Monitor } from '../shared/types.js';
+export function fixture(overrides: Partial<Monitor> = {}): Monitor {
+  return {
+    id: 'fixture',
+    name: '测试服务',
+    group: '测试',
+    provider: 'openai',
+    endpoint: 'chat',
+    baseUrl: 'https://api.example.com/v1',
+    model: 'test-model',
+    icon: 'auto',
+    enabled: true,
+    intervalSeconds: 900,
+    timeoutSeconds: 5,
+    maxTokens: 32,
+    prompt: 'Count from 1 to 10.',
+    path: '',
+    body: {},
+    ttftThresholdMs: 3000,
+    tpsThreshold: 0,
+    latencyThresholdMs: 30000,
+    createdAt: Date.now(),
+    nextRunAt: Date.now(),
+    failureSince: null,
+    lastHealth: 'unknown',
+    secret: '',
+    revision: 1,
+    ...overrides,
+  };
+}
