@@ -25,7 +25,12 @@ import { Incidents } from './Incidents';
 import { Alerts } from './Alerts';
 import { Settings } from './Settings';
 
-type Session = { initialized: boolean; authenticated: boolean; csrf: string | null };
+type Session = {
+  initialized: boolean;
+  authenticated: boolean;
+  csrf: string | null;
+  casdoorEnabled?: boolean;
+};
 const links = [
   ['/admin', '运行概览', LayoutDashboard],
   ['/admin/monitors', '监控目标', SquareActivity],
@@ -83,6 +88,9 @@ export function Admin() {
     return (
       <Login
         initialized={session.initialized}
+        casdoorEnabled={!!session.casdoorEnabled}
+        pending={new URLSearchParams(location.search).get('casdoor') === 'pending'}
+        casdoorError={new URLSearchParams(location.search).get('casdoor') === 'error'}
         onLogin={(value) => {
           setSession(value);
           setCsrf(value.csrf);
@@ -208,15 +216,96 @@ export function Admin() {
 }
 function Login({
   initialized,
+  casdoorEnabled,
+  pending,
+  casdoorError,
   onLogin,
 }: {
   initialized: boolean;
+  casdoorEnabled: boolean;
+  pending: boolean;
+  casdoorError: boolean;
   onLogin: (session: Session) => void;
 }) {
   const [password, setPassword] = useState(''),
     [confirm, setConfirm] = useState(''),
     [error, setError] = useState(''),
-    [busy, setBusy] = useState(false);
+    [busy, setBusy] = useState(false),
+    [profile, setProfile] = useState<{ displayName?: string; email?: string } | null>(null);
+  useEffect(() => {
+    if (!pending) return;
+    void api<{ profile: { displayName?: string; email?: string } }>('/auth/casdoor/pending')
+      .then((value) => setProfile(value.profile))
+      .catch((e) => setError(e.message));
+  }, [pending]);
+  if (pending)
+    return (
+      <div className="auth-page">
+        <Link to="/">
+          <Brand />
+        </Link>
+        <div className="auth-card">
+          <div className="auth-symbol">
+            <ShieldCheck size={25} />
+          </div>
+          <span className="section-kicker">CASDOOR ACCOUNT LINK</span>
+          <h1>绑定现有管理员</h1>
+          <p>
+            {profile?.displayName || profile?.email
+              ? `已通过 Casdoor 验证 ${profile.displayName ?? profile.email}。`
+              : '已通过 Casdoor 验证。'}
+            请输入本控制台现有管理员密码完成一次性绑定。
+          </p>
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              setError('');
+              setBusy(true);
+              void api<Session>('/auth/casdoor/bind', {
+                method: 'POST',
+                body: { password },
+                headers: { 'x-casdoor-bind': '1' },
+              })
+                .then((value) => {
+                  window.history.replaceState({}, '', '/admin');
+                  onLogin(value);
+                })
+                .catch((e) => setError(e.message))
+                .finally(() => setBusy(false));
+            }}
+          >
+            <Field label="管理员密码">
+              <input
+                autoFocus
+                type="password"
+                autoComplete="current-password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                maxLength={128}
+                required
+              />
+            </Field>
+            {error && (
+              <div className="form-error" role="alert">
+                {error}
+              </div>
+            )}
+            <button className="button primary auth-submit" disabled={busy}>
+              {busy ? <Spinner /> : null}
+              完成绑定
+              <ArrowRight size={16} />
+            </button>
+          </form>
+          <div className="auth-security">
+            <ShieldCheck size={13} />
+            仅绑定已有管理员 · 不会创建新账号
+          </div>
+        </div>
+        <Link to="/admin" className="muted auth-back">
+          返回登录
+        </Link>
+      </div>
+    );
   return (
     <div className="auth-page">
       <Link to="/">
@@ -282,6 +371,22 @@ function Login({
             <ArrowRight size={16} />
           </button>
         </form>
+        {initialized && casdoorEnabled && (
+          <>
+            <div className="auth-divider">
+              <span>或</span>
+            </div>
+            <a className="button secondary auth-submit" href="/api/auth/casdoor/start">
+              使用 Casdoor 登录
+              <ArrowRight size={16} />
+            </a>
+          </>
+        )}
+        {casdoorError && (
+          <div className="form-error" role="alert">
+            Casdoor 登录未完成，请重新尝试。
+          </div>
+        )}
         <div className="auth-security">
           <ShieldCheck size={13} />
           密码哈希存储 · HttpOnly 安全会话

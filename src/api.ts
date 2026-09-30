@@ -12,7 +12,12 @@ export class ApiError extends Error {
 }
 export async function api<T>(
   path: string,
-  options: { method?: string; body?: unknown; signal?: AbortSignal } = {},
+  options: {
+    method?: string;
+    body?: unknown;
+    signal?: AbortSignal;
+    headers?: Record<string, string>;
+  } = {},
 ): Promise<T> {
   const response = await fetch('/api' + path, {
     method: options.method ?? 'GET',
@@ -20,6 +25,7 @@ export async function api<T>(
     headers: {
       ...(options.body !== undefined ? { 'Content-Type': 'application/json' } : {}),
       ...(csrf ? { 'x-csrf-token': csrf } : {}),
+      ...options.headers,
     },
     credentials: 'same-origin',
     ...(options.body !== undefined ? { body: JSON.stringify(options.body) } : {}),

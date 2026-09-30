@@ -18,6 +18,8 @@ npm run dev
 
 第一次进入后台时，在本机设置至少 12 位的管理员密码。**没有预设管理员密码**。正式数据库不会预置监控或演示数据。
 
+可选接入 Casdoor：在服务端 `.env` 同时设置 `CASDOOR_ORIGIN`、`CASDOOR_CLIENT_ID`、`CASDOOR_CLIENT_SECRET`、`CASDOOR_REDIRECT_URI`，并在 Casdoor 应用中登记完全一致的 Authorization Code 回调地址。控制台登录页会显示 Casdoor 入口；首次使用必须用已有管理员密码完成一次性绑定，不会自动创建账号。client secret 只在服务端使用。
+
 生产构建与启动：
 
 ```sh

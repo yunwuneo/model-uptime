@@ -2209,6 +2209,21 @@ textarea::placeholder {
   width: 100%;
   margin-top: 1px;
 }
+.auth-divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 16px 0;
+  color: #91a098;
+  font-size: 12px;
+}
+.auth-divider::before,
+.auth-divider::after {
+  content: '';
+  height: 1px;
+  flex: 1;
+  background: #e2eae5;
+}
 .auth-security {
   display: flex;
   align-items: center;

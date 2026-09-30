@@ -35,6 +35,17 @@ export class Store {
       CREATE TABLE IF NOT EXISTS channels (id TEXT PRIMARY KEY, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS alerts (id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, expires INTEGER NOT NULL, csrf TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS casdoor_accounts (
+        subject TEXT PRIMARY KEY,
+        username TEXT NOT NULL UNIQUE,
+        created_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS casdoor_link_intents (
+        token_hash TEXT PRIMARY KEY,
+        subject TEXT NOT NULL,
+        profile TEXT NOT NULL,
+        expires_at INTEGER NOT NULL
+      );
     `);
     if (!this.get('settings')) this.set('settings', defaults);
   }
@@ -154,6 +165,49 @@ export class Store {
       .prepare('DELETE FROM alerts WHERE created_at < ?')
       .run(now - this.settings().retentionDays * 86400000);
     this.db.prepare('DELETE FROM sessions WHERE expires < ?').run(now);
+    this.db.prepare('DELETE FROM casdoor_link_intents WHERE expires_at < ?').run(now);
+  }
+  casdoorAccount(subject: string): { subject: string; username: string } | null {
+    return (
+      (this.db
+        .prepare('SELECT subject, username FROM casdoor_accounts WHERE subject = ?')
+        .get(subject) as { subject: string; username: string } | undefined) ?? null
+    );
+  }
+  casdoorUsername(username: string): { subject: string; username: string } | null {
+    return (
+      (this.db
+        .prepare('SELECT subject, username FROM casdoor_accounts WHERE username = ?')
+        .get(username) as { subject: string; username: string } | undefined) ?? null
+    );
+  }
+  saveCasdoorAccount(subject: string, username: string) {
+    this.db
+      .prepare('INSERT INTO casdoor_accounts(subject, username, created_at) VALUES (?, ?, ?)')
+      .run(subject, username, Date.now());
+  }
+  saveCasdoorIntent(tokenHash: string, subject: string, profile: unknown, expiresAt: number) {
+    this.db
+      .prepare(
+        'INSERT OR REPLACE INTO casdoor_link_intents(token_hash, subject, profile, expires_at) VALUES (?, ?, ?, ?)',
+      )
+      .run(tokenHash, subject, JSON.stringify(profile), expiresAt);
+  }
+  casdoorIntent(
+    tokenHash: string,
+  ): { subject: string; profile: unknown; expiresAt: number } | null {
+    const row = this.db
+      .prepare('SELECT subject, profile, expires_at FROM casdoor_link_intents WHERE token_hash = ?')
+      .get(tokenHash) as { subject: string; profile: string; expires_at: number } | undefined;
+    if (!row || row.expires_at <= Date.now()) {
+      if (row)
+        this.db.prepare('DELETE FROM casdoor_link_intents WHERE token_hash = ?').run(tokenHash);
+      return null;
+    }
+    return { subject: row.subject, profile: JSON.parse(row.profile), expiresAt: row.expires_at };
+  }
+  deleteCasdoorIntent(tokenHash: string) {
+    this.db.prepare('DELETE FROM casdoor_link_intents WHERE token_hash = ?').run(tokenHash);
   }
   close() {
     this.db.close();

@@ -14,6 +14,12 @@ import { channelSchema, incidentSchema, monitorSchema, settingsSchema } from './
 import { deliver, safeChannelConfig } from './alerts.js';
 
 type Admin = { salt: string; hash: string };
+type CasdoorConfig = {
+  origin: string;
+  clientId: string;
+  clientSecret: string;
+  redirectUri: string;
+};
 const hashToken = (token: string) => createHash('sha256').update(token).digest('hex');
 const passwordHash = (password: string, salt: string) =>
   scryptSync(password, salt, 64).toString('hex');
@@ -36,6 +42,44 @@ function cookie(req: Request, name: string) {
       ?.slice(name.length + 1) ?? ''
   );
 }
+function casdoorConfig(): CasdoorConfig | null {
+  const origin = process.env.CASDOOR_ORIGIN?.trim() ?? '';
+  const clientId = process.env.CASDOOR_CLIENT_ID?.trim() ?? '';
+  const clientSecret = process.env.CASDOOR_CLIENT_SECRET?.trim() ?? '';
+  const redirectUri = process.env.CASDOOR_REDIRECT_URI?.trim() ?? '';
+  if (![origin, clientId, clientSecret, redirectUri].some(Boolean)) return null;
+  if (![origin, clientId, clientSecret, redirectUri].every(Boolean))
+    throw new Error(
+      'Casdoor 配置不完整，需要 CASDOOR_ORIGIN、CASDOOR_CLIENT_ID、CASDOOR_CLIENT_SECRET 和 CASDOOR_REDIRECT_URI',
+    );
+  if (
+    process.env.NODE_ENV === 'production' &&
+    (!origin.startsWith('https://') || !redirectUri.startsWith('https://'))
+  )
+    throw new Error('生产环境 Casdoor origin 和回调地址必须使用 HTTPS');
+  try {
+    const originUrl = new URL(origin);
+    const redirectUrl = new URL(redirectUri);
+    if (
+      !['http:', 'https:'].includes(originUrl.protocol) ||
+      !['http:', 'https:'].includes(redirectUrl.protocol)
+    )
+      throw new Error();
+  } catch {
+    throw new Error('Casdoor origin 和回调地址必须是有效的 HTTP(S) URL');
+  }
+  return { origin: origin.replace(/\/$/, ''), clientId, clientSecret, redirectUri };
+}
+function safeCasdoorProfile(value: Record<string, unknown>) {
+  const displayName = [
+    value.name,
+    value.displayName,
+    value.preferred_username,
+    value.username,
+  ].find((item): item is string => typeof item === 'string' && item.length > 0);
+  const email = typeof value.email === 'string' ? value.email : undefined;
+  return { displayName: displayName?.slice(0, 160), email: email?.slice(0, 320) };
+}
 const wrap =
   (handler: (req: Request, res: Response) => Promise<unknown>) =>
   (req: Request, res: Response, next: NextFunction) => {
@@ -45,6 +89,7 @@ const wrap =
 export function createApp(store: Store, options: { worker?: boolean; staticDir?: string } = {}) {
   const app = express(),
     worker = new Worker(store);
+  const casdoor = casdoorConfig();
   const secure = process.env.COOKIE_SECURE === 'true';
   const cookieOptions = {
     httpOnly: true,
@@ -53,6 +98,14 @@ export function createApp(store: Store, options: { worker?: boolean; staticDir?:
     path: '/',
     maxAge: 7 * 86400000,
   };
+  const casdoorStateCookie = {
+    httpOnly: true,
+    sameSite: 'lax' as const,
+    secure,
+    path: '/',
+    maxAge: 10 * 60 * 1000,
+  };
+  const casdoorLinkCookie = { ...casdoorStateCookie, maxAge: 10 * 60 * 1000 };
   app.disable('x-powered-by');
   if (process.env.TRUST_PROXY === '1') app.set('trust proxy', 1);
   app.use(
@@ -108,6 +161,7 @@ export function createApp(store: Store, options: { worker?: boolean; staticDir?:
       initialized: !!store.get('admin'),
       authenticated: !!session,
       csrf: session?.csrf ?? null,
+      casdoorEnabled: !!casdoor,
     });
   });
   const attempts = new Map<string, { count: number; reset: number }>();
@@ -123,16 +177,138 @@ export function createApp(store: Store, options: { worker?: boolean; staticDir?:
       for (const [k, v] of attempts) if (v.reset < Date.now()) attempts.delete(k);
     next();
   }
-  function signIn(res: Response) {
+  function signIn(res: Response, redirectPath?: string) {
     const token = randomBytes(32).toString('hex'),
       csrf = randomBytes(24).toString('hex');
     store.db
       .prepare('INSERT INTO sessions VALUES (?, ?, ?)')
       .run(hashToken(token), Date.now() + cookieOptions.maxAge, csrf);
-    res
-      .cookie('lumen_session', token, cookieOptions)
-      .json({ authenticated: true, initialized: true, csrf });
+    const response = res.cookie('lumen_session', token, cookieOptions);
+    if (redirectPath) return response.redirect(redirectPath);
+    return response.json({ authenticated: true, initialized: true, csrf });
   }
+  app.get('/api/auth/casdoor/config', (_req, res) => {
+    res.json({ enabled: !!casdoor });
+  });
+  app.get('/api/auth/casdoor/start', (req, res) => {
+    if (!casdoor) return res.status(404).json({ error: 'Casdoor 登录未启用' });
+    if (!store.get('admin')) return res.status(409).json({ error: '请先初始化管理员' });
+    const state = randomBytes(32).toString('hex');
+    const authorize = new URL(`${casdoor.origin}/login/oauth/authorize`);
+    authorize.search = new URLSearchParams({
+      client_id: casdoor.clientId,
+      response_type: 'code',
+      redirect_uri: casdoor.redirectUri,
+      scope: 'openid profile email',
+      state,
+    }).toString();
+    res.cookie('lumen_casdoor_state', state, casdoorStateCookie).redirect(authorize.toString());
+  });
+  app.get(
+    '/api/auth/casdoor/callback',
+    wrap(async (req, res) => {
+      if (!casdoor) return res.status(404).send('Casdoor 登录未启用');
+      const state = typeof req.query.state === 'string' ? req.query.state : '';
+      const expected = cookie(req, 'lumen_casdoor_state');
+      res.clearCookie('lumen_casdoor_state', casdoorStateCookie);
+      if (
+        !state ||
+        !expected ||
+        state.length !== expected.length ||
+        !timingSafeEqual(Buffer.from(state), Buffer.from(expected))
+      )
+        return res.status(400).send('Casdoor 登录状态无效，请重新发起登录');
+      const code = typeof req.query.code === 'string' ? req.query.code : '';
+      if (!code) return res.status(400).send('Casdoor 登录未返回授权码');
+      const tokenResponse = await fetch(`${casdoor.origin}/api/login/oauth/access_token`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/x-www-form-urlencoded',
+          accept: 'application/json',
+        },
+        body: new URLSearchParams({
+          grant_type: 'authorization_code',
+          client_id: casdoor.clientId,
+          client_secret: casdoor.clientSecret,
+          code,
+          redirect_uri: casdoor.redirectUri,
+        }),
+      });
+      if (!tokenResponse.ok) return res.status(502).send('Casdoor 登录失败，请稍后重试');
+      const tokenBody = (await tokenResponse.json()) as { access_token?: unknown };
+      if (typeof tokenBody.access_token !== 'string' || !tokenBody.access_token)
+        return res.status(502).send('Casdoor 登录失败，请稍后重试');
+      const profileResponse = await fetch(`${casdoor.origin}/api/userinfo`, {
+        headers: { authorization: `Bearer ${tokenBody.access_token}`, accept: 'application/json' },
+      });
+      if (!profileResponse.ok) return res.status(502).send('Casdoor 登录失败，请稍后重试');
+      const profile = (await profileResponse.json()) as Record<string, unknown>;
+      const subject =
+        typeof profile.sub === 'string' && profile.sub
+          ? profile.sub
+          : typeof profile.id === 'string'
+            ? profile.id
+            : '';
+      if (!subject) return res.status(502).send('Casdoor 身份信息无效，请联系管理员');
+      const account = store.casdoorAccount(subject);
+      if (account) return signIn(res, '/admin');
+      store.db.prepare('DELETE FROM casdoor_link_intents WHERE expires_at < ?').run(Date.now());
+      const linkToken = randomBytes(32).toString('hex');
+      store.saveCasdoorIntent(
+        hashToken(linkToken),
+        subject,
+        safeCasdoorProfile(profile),
+        Date.now() + 10 * 60 * 1000,
+      );
+      return res
+        .cookie('lumen_casdoor_link', linkToken, casdoorLinkCookie)
+        .redirect('/admin?casdoor=pending');
+    }),
+  );
+  app.get('/api/auth/casdoor/pending', (req, res) => {
+    if (!casdoor) return res.status(404).json({ error: 'Casdoor 登录未启用' });
+    const intent = store.casdoorIntent(hashToken(cookie(req, 'lumen_casdoor_link')));
+    if (!intent) return res.status(404).json({ error: '绑定已失效，请重新使用 Casdoor 登录' });
+    res.json({ pending: true, profile: intent.profile });
+  });
+  app.post('/api/auth/casdoor/bind', throttle, (req, res) => {
+    if (!casdoor) return res.status(404).json({ error: 'Casdoor 登录未启用' });
+    const origin = req.headers.origin;
+    const allowed = new Set([
+      process.env.PUBLIC_ORIGIN ?? 'http://localhost:3001',
+      'http://127.0.0.1:3001',
+    ]);
+    if (process.env.NODE_ENV !== 'production') {
+      allowed.add('http://localhost:5173');
+      allowed.add('http://127.0.0.1:5173');
+    }
+    if (req.headers['x-casdoor-bind'] !== '1' || !origin || !allowed.has(origin))
+      return res.status(403).json({ error: '绑定请求来源不受信任' });
+    const token = cookie(req, 'lumen_casdoor_link');
+    const intent = store.casdoorIntent(hashToken(token));
+    const admin = store.get<Admin>('admin');
+    if (!intent || !admin)
+      return res.status(400).json({ error: '绑定已失效，请重新使用 Casdoor 登录' });
+    if (
+      typeof req.body.password !== 'string' ||
+      req.body.password.length > 128 ||
+      !matches(req.body.password, admin)
+    )
+      return res.status(401).json({ error: '用户名或密码不正确' });
+    const existing = store.casdoorUsername('admin');
+    if (existing && existing.subject !== intent.subject)
+      return res.status(409).json({ error: '该管理员账号已经绑定其他 Casdoor 身份' });
+    if (!existing) {
+      try {
+        store.saveCasdoorAccount(intent.subject, 'admin');
+      } catch {
+        return res.status(409).json({ error: '该管理员账号已经绑定其他 Casdoor 身份' });
+      }
+    }
+    store.deleteCasdoorIntent(hashToken(token));
+    res.clearCookie('lumen_casdoor_link', casdoorLinkCookie);
+    signIn(res);
+  });
   app.post('/api/auth/setup', throttle, (req, res) => {
     if (store.get('admin')) return res.status(409).json({ error: '管理员已经初始化' });
     const address = req.socket.remoteAddress;
